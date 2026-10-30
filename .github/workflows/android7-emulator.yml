@@ -27,9 +27,10 @@ jobs:
       - name: free disk space
         run: |
           set +e
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/ndk \
-                      /usr/local/lib/android/sdk/emulator \
-                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          # Never delete anything under $ANDROID_HOME. Dropping sdk/emulator and
+          # sdk/ndk makes setup-android@v3 fail with `Failed to find package 'tools'`
+          # before it installs anything (run 41026740164, step 4).
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
           df -h /
 
       - uses: actions/setup-java@v4
@@ -37,7 +38,12 @@ jobs:
           distribution: zulu
           java-version: "17"
 
+      # `packages:` must be explicit: the action defaults to `tools platform-tools`,
+      # and `tools` is no longer published in the SDK repo, so sdkmanager dies with
+      # "Failed to find package 'tools'" (run 41026740164, step 4).
       - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
 
       - name: fetch the newest assertion-passed release apk
         env:
