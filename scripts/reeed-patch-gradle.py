@@ -1,54 +1,131 @@
 #!/usr/bin/env python3
-"""Fix the Gradle variant-ambiguity that breaks a Tauri-generated Android project.
+"""Patch the Android project that `pnpm tauri android init` generated (route A).
 
-`pnpm tauri android init` regenerates `gen/android/app/build.gradle.kts` from the
-Tauri template. That template does not know about the product flavors declared by
-`tauri-plugin-native-bridge` (store: foss/googleplay, pen: genericPen/booxPen), so
-Gradle cannot pick a variant for `:tauri-plugin-native-bridge` and the build dies:
+Route A = "do not restore the upstream tracked `gen/android`". That keeps the
+package id and minSdk coming from `tauri.conf.json`, but it also loses the
+upstream hand-maintained bits. This script restores the three things that have
+to exist for the APK to be usable at all, and then *verifies* them:
 
-    Could not resolve project :tauri-plugin-native-bridge
-    The only attribute distinguishing these variants is ... VariantAttr
+  1. `missingDimensionStrategy("store"/"pen")` — otherwise Gradle cannot pick a
+     variant for `:tauri-plugin-native-bridge` and the build dies with
+     "The only attribute distinguishing these variants is 'VariantAttr'".
+  2. `android:largeHeap="true"` in the manifest — the target devices are 512 MB
+     e-readers; without it the WebView OOMs much earlier. Upstream tracked
+     manifest carries it; the Tauri template does not.
+  3. `minSdk = 25` and `applicationId = "app.reeed.reader"` — asserted, not
+     written: they come from `tauri.conf.json` via `tauri android init`. If a
+     future run goes back to restoring the tracked gradle (`minSdk = 26`,
+     `com.bilingify.readest`), the assertions fail loudly instead of quietly
+     shipping an APK that will not install on API 25.
 
-Upstream keeps a hand-maintained `gen/android/app/build.gradle.kts` carrying
-`missingDimensionStrategy(...)` for both dimensions (and their release workflow
-restores it with `git checkout .`). We do not restore the file — we only inject the
-two lines it needs, so the regenerated project keeps our own minSdkVersion and
-package id.
+Any failed assertion is a hard failure (exit 1). The script never prints
+"nothing to do" and returns 0 on a project it has not verified.
 """
+import os
+import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-GRADLE = ROOT / "apps" / "readest-app" / "src-tauri" / "gen" / "android" / "app" / "build.gradle.kts"
+ANDROID = ROOT / "apps" / "readest-app" / "src-tauri" / "gen" / "android"
+GRADLE = ANDROID / "app" / "build.gradle.kts"
+MANIFEST = ANDROID / "app" / "src" / "main" / "AndroidManifest.xml"
 
-INJECT = (
-    '        // Reeed: match the flavors declared by tauri-plugin-native-bridge,\n'
-    '        // otherwise Gradle cannot resolve its variant (VariantAttr ambiguity).\n'
-    '        missingDimensionStrategy("store", project.findProperty("storeFlavor")?.toString() ?: "foss")\n'
-    '        missingDimensionStrategy("pen", project.findProperty("penFlavor")?.toString() ?: "genericPen")\n'
+EXPECT_MIN_SDK = "minSdk = 25"
+EXPECT_APP_ID = 'applicationId = "app.reeed.reader"'
+LARGE_HEAP = 'android:largeHeap="true"'
+
+DIMENSIONS = (
+    ("store", "foss"),
+    ("pen", "genericPen"),
 )
 
 
-def main() -> int:
-    if not GRADLE.exists():
-        print(f"gradle file not found: {GRADLE}", file=sys.stderr)
-        return 1
-    text = GRADLE.read_text(encoding="utf-8")
-    if "missingDimensionStrategy" in text:
-        print("missingDimensionStrategy already present; nothing to do")
-        return 0
-    marker = "defaultConfig {"
-    idx = text.find(marker)
+def _inject(text: str, anchor: str, payload: str) -> str:
+    """Insert `payload` right after the line that opens `anchor`."""
+    idx = text.find(anchor)
     if idx < 0:
-        print(f"`{marker}` not found in {GRADLE}", file=sys.stderr)
-        return 1
+        return text
     insert_at = text.find("\n", idx) + 1
-    patched = text[:insert_at] + INJECT + text[insert_at:]
-    GRADLE.write_text(patched, encoding="utf-8")
-    print("injected missingDimensionStrategy after defaultConfig {")
-    for line in patched.splitlines():
-        if "missingDimensionStrategy" in line or "minSdk" in line or "applicationId" in line or "namespace" in line:
-            print("  ", line.strip())
+    return text[:insert_at] + payload + text[insert_at:]
+
+
+def patch_gradle(text: str) -> tuple[str, list[str]]:
+    """Add the missing flavour strategies; report which dimensions were added."""
+    missing = [(dim, default) for dim, default in DIMENSIONS
+               if f'missingDimensionStrategy("{dim}"' not in text]
+    if not missing:
+        return text, []
+    payload = (
+        "        // Reeed: match the flavours declared by tauri-plugin-native-bridge,\n"
+        "        // otherwise Gradle cannot resolve its variant (VariantAttr ambiguity).\n"
+    )
+    payload += "".join(
+        f'        missingDimensionStrategy("{dim}", '
+        f'project.findProperty("{dim}Flavor")?.toString() ?: "{default}")\n'
+        for dim, default in missing
+    )
+    return _inject(text, "defaultConfig {", payload), [dim for dim, _ in missing]
+
+
+def patch_manifest(text: str) -> tuple[str, bool]:
+    """Add `android:largeHeap="true"` to <application>; idempotent."""
+    if LARGE_HEAP in text:
+        return text, False
+    match = re.search(r"<application\b[^>]*>", text, re.S)
+    if match is None:
+        return text, False
+    tag = match.group(0)
+    new_tag = tag[:-1].rstrip() + f"\n        {LARGE_HEAP}>"
+    return text[: match.start()] + new_tag + text[match.end():], True
+
+
+def main() -> int:
+    problems = []
+    for path in (GRADLE, MANIFEST):
+        if not path.exists():
+            problems.append(f"missing file: {path}")
+    if problems:
+        print("\n".join(problems), file=sys.stderr)
+        return 1
+
+    gradle = GRADLE.read_text(encoding="utf-8")
+    gradle, added = patch_gradle(gradle)
+    if added:
+        GRADLE.write_text(gradle, encoding="utf-8")
+        print(f"injected missingDimensionStrategy for: {', '.join(added)}")
+
+    manifest = MANIFEST.read_text(encoding="utf-8")
+    manifest, added_heap = patch_manifest(manifest)
+    if added_heap:
+        MANIFEST.write_text(manifest, encoding="utf-8")
+        print(f"injected {LARGE_HEAP}")
+
+    # Report the flavours that will actually be used, so the CI log records them.
+    for dim, default in DIMENSIONS:
+        env_key = f"ORG_GRADLE_PROJECT_{dim}Flavor"
+        source = f"env {env_key}" if os.environ.get(env_key) else "script default"
+        print(f"flavour {dim}={os.environ.get(env_key, default)} ({source})")
+
+    # Hard assertions: a route change or a template change must fail the job.
+    checks = (
+        (GRADLE, EXPECT_MIN_SDK, "regenerated gradle did not take tauri.conf minSdkVersion"),
+        (GRADLE, EXPECT_APP_ID, "regenerated gradle did not take tauri.conf identifier"),
+        (GRADLE, 'missingDimensionStrategy("store"', "store dimension not injected"),
+        (GRADLE, 'missingDimensionStrategy("pen"', "pen dimension not injected"),
+        (MANIFEST, LARGE_HEAP, "largeHeap missing from the generated manifest"),
+    )
+    for path, needle, reason in checks:
+        if needle not in path.read_text(encoding="utf-8"):
+            problems.append(f"{reason}: {needle!r} not found in {path}")
+
+    if problems:
+        print("", file=sys.stderr)
+        for problem in problems:
+            print(f"ASSERTION FAILED: {problem}", file=sys.stderr)
+        return 1
+
+    print("verified: minSdk=25, applicationId=app.reeed.reader, largeHeap, both flavours")
     return 0
 
 

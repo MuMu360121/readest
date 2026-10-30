@@ -25,6 +25,11 @@ OLD_NAME = "Readest"
 UPSTREAM_UPDATE_HOST = "readest.com"
 PLACEHOLDER_ENDPOINT = "https://example.invalid/reeed/latest.json"
 MIN_SDK = 25
+# API 25 上 WebView 上限就是 119（Chrome 120 起不再支持 Android 7），
+# 上游的 121 在目标设备上永远不可达，留着只会每次启动做一次无谓探测并
+# 打一条会被误读成故障的 W/ 日志。
+WEBVIEW_MIN_UPGRADE = 119
+WEBVIEW_MIN_SUPPORTED = 111
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "apps" / "readest-app"
@@ -43,6 +48,15 @@ def patch_tauri_conf() -> None:
     conf["productName"] = NEW_NAME
     conf["identifier"] = NEW_ID
     conf.setdefault("bundle", {}).setdefault("android", {})["minSdkVersion"] = MIN_SDK
+
+    plugins = conf.setdefault("plugins", {})
+    webview_upgrade = plugins.get("webview-upgrade")
+    if isinstance(webview_upgrade, dict):
+        webview_upgrade["minUpgradeMajor"] = WEBVIEW_MIN_UPGRADE
+        if "minSupportedMajor" in webview_upgrade:
+            assert webview_upgrade["minSupportedMajor"] == WEBVIEW_MIN_SUPPORTED, (
+                "minSupportedMajor 被上游改动，需重新评估 119 设备是否仍算支持"
+            )
 
     updater = conf.get("plugins", {}).get("updater")
     if isinstance(updater, dict):
@@ -151,7 +165,13 @@ def main() -> int:
     for rel in changed:
         print(f"  {rel}")
     print(f"locale files updated: {locale_files}")
-    print(f"productName={NEW_NAME} identifier={NEW_ID} minSdk={MIN_SDK}")
+    conf = json.loads((APP / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
+    wu = (conf.get("plugins") or {}).get("webview-upgrade") or {}
+    print(
+        f"productName={NEW_NAME} identifier={NEW_ID} minSdk={MIN_SDK} "
+        f"webview-upgrade={{minUpgradeMajor:{wu.get('minUpgradeMajor')}, "
+        f"minSupportedMajor:{wu.get('minSupportedMajor')}}}"
+    )
     return 0
 
 
