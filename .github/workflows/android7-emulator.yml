@@ -73,7 +73,7 @@ jobs:
           # of what API 25 images ARE published instead of a bare "package not found".
           sdkmanager "platform-tools" "emulator" \
             || { sdkmanager --list | grep -i "system-images;android-25" || true; exit 1; }
-          sdkmanager "system-images;android-25;default;armeabi-v7a" \
+          sdkmanager "system-images;android-25;google_apis;armeabi-v7a" \
             || { echo "IMAGE_UNAVAILABLE"; sdkmanager --list | grep -i "system-images;android-2[456]" || true; exit 1; }
           echo "yes" | sdkmanager --list_installed | head -20 || true
 
@@ -81,7 +81,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "no" | avdmanager create avd -n api25 \
-            -k "system-images;android-25;default;armeabi-v7a" -d pixel --force
+            -k "system-images;android-25;google_apis;armeabi-v7a" -d pixel --force
           cat "$HOME/.android/avd/api25.avd/config.ini" | head -20
 
       - name: boot the emulator (software ARM, slow by nature)
