@@ -41,6 +41,9 @@ class ReeedApplication : Application() {
                 // 先落盘再拉界面：:crash 进程万一被 ROM 一起收走，文件还在。
                 val path = CrashReport.write(app, report)
 
+                // 同一份内容再打一次 logcat：万一只剩日志通道（或有 logcat 抓取），也能拿到。
+                android.util.Log.e("REED_CRASH", report)
+
                 val intent = Intent(app, CrashActivity::class.java).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK)
