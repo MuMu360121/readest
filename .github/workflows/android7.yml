@@ -132,10 +132,13 @@ jobs:
           echo "--- apksigner verify ---"
           # Persisted into the artifact, not only the log: P0-9 asks for one fingerprint
           # across builds, and a log that expires cannot answer that question later.
-          "$BUILD_TOOLS/apksigner" verify --print-certs "$APK" | tee "$RUNNER_TEMP/certs.txt"
+          # -v also prints "Verified using v1/v2/v3 scheme" - Android 7.1 only reads v1
+          # and v2, so a v3-only package would pass every other assertion and then fail
+          # to install on the device. That line is the only first-hand evidence for it.
+          "$BUILD_TOOLS/apksigner" verify -v --print-certs "$APK" | tee "$RUNNER_TEMP/certs.txt"
           echo "--- badging ---"
           "$AAPT2" dump badging "$APK" \
-            | grep -E "^(package:|sdkVersion:|targetSdkVersion:|native-code:|application-label:)" || true
+            | grep -E "^(package:|sdkVersion:|minSdkVersion:|targetSdkVersion:|native-code:|application-label:)" || true
           echo "--- manifest (largeHeap) ---"
           "$AAPT2" dump xmltree --file AndroidManifest.xml "$APK" | grep -i largeHeap || true
           "$AAPT2" dump badging "$APK" > "$RUNNER_TEMP/badging.txt"
@@ -173,6 +176,10 @@ jobs:
           grep -i largeHeap "$RUNNER_TEMP/manifest.xmltree.txt" \
             | grep -qiE "0xffffffff|true" \
             || { echo "ASSERT FAIL: largeHeap missing or not true"; exit 1; }
+          # P0-1 prerequisite: Android 7.1 verifies v1 and v2 only. A v3-only package
+          # installs on nothing older than API 28 while every other assertion is green.
+          grep -qE "Verified using v[12] scheme.*: true" "$RUNNER_TEMP/certs.txt" \
+            || { echo "ASSERT FAIL: no v1/v2 signature scheme (7.1 cannot install this package)"; exit 1; }
           echo "APK_ASSERTIONS=passed" >> "$GITHUB_ENV"
 
       - name: css nesting evidence (diagnostic only)
@@ -189,6 +196,21 @@ jobs:
             echo "css files: ${#CSS[@]}"
             for f in "${CSS[@]}"; do
               printf '%s %s\n' "$(grep -o '&' "$f" | wc -l)" "$f"
+            done
+            # A bare `&` count says nothing about what Chromium 119 drops: `&:hover`,
+            # `& .x`, `&::-webkit-*` are fine from Chromium 112; only a *declaration
+            # written after a nested rule inside the same block* needs 120. Dump the
+            # shapes so the classification is read, not guessed.
+            echo "--- & contexts (top 25 by frequency) ---"
+            for f in "${CSS[@]}"; do
+              [ "$(grep -c '&' "$f")" -eq 0 ] && continue
+              echo "== $f"
+              grep -o '.\{0,28\}&.\{0,28\}' "$f" | sort | uniq -c | sort -rn | head -25
+              # Chrome-120-only shape: `}` closing a nested rule followed by further
+              # declarations of the parent block (`}color:red`). At top level minified
+              # CSS only ever has `}selector{`, never `}prop:`, so a non-zero count here
+              # is the 120 gate; zero means 112-compatible nesting.
+              printf 'POST_RULE_DECL=%s\n' "$(grep -oE '\}[a-zA-Z-]+:[^;}]*[;}]' "$f" | wc -l)"
             done
           fi
 
