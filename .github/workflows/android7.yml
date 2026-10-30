@@ -1,0 +1,96 @@
+name: Android 7.1 (API 25) Reeed APK
+
+# Builds a self-branded (Reeed) armv7 debug APK whose minSdkVersion is 25,
+# so it installs on Android 7.1 / API 25 containers (Kindle e-readers etc.).
+# Debug build: no signing config needed, sideloadable as-is.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tauri_target:
+        description: 'Tauri/Android target (armv7 / arm64 / i686 / x86_64)'
+        required: false
+        default: 'armv7'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+
+      - name: install NDK
+        run: sdkmanager "ndk;28.2.13676358"
+
+      - name: install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: copy vendors (pdfjs, simplecc)
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-linux-androideabi
+
+      - name: rebrand to Reeed and lower minSdkVersion
+        run: |
+          python3 scripts/reeed-branding.py
+          echo "--- effective tauri config ---"
+          jq '{productName, mainBinaryName, identifier, android: .bundle.android, updater: .plugins.updater}' \
+            apps/readest-app/src-tauri/tauri.conf.json
+
+      - name: create .env.local
+        run: |
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" > .env.local
+          cp .env.local apps/readest-app/.env.local
+
+      - name: android init (regenerates gradle from tauri.conf.json)
+        working-directory: apps/readest-app
+        run: |
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          echo "--- generated applicationId / sdk levels ---"
+          grep -nE "applicationId|namespace|minSdk|targetSdk|compileSdk" \
+            src-tauri/gen/android/app/build.gradle.kts
+
+      - name: apply icon
+        working-directory: apps/readest-app
+        run: pnpm tauri icon ../../data/icons/reeed.png
+
+      - name: build debug apk
+        working-directory: apps/readest-app
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+        run: pnpm tauri android build -t "${{ inputs.tauri_target }}" --debug
+
+      - name: report apks
+        run: find apps/readest-app/src-tauri/gen/android/app/build/outputs -name "*.apk" -printf "%p %s bytes\n" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reeed-minsdk25-${{ inputs.tauri_target }}-debug
+          path: apps/readest-app/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
