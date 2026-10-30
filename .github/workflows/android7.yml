@@ -95,7 +95,9 @@ jobs:
           # (tauri android build does not forward -P to Gradle).
           ORG_GRADLE_PROJECT_storeFlavor: foss
           ORG_GRADLE_PROJECT_penFlavor: genericPen
-        run: pnpm tauri android build -t "${{ inputs.tauri_target }}" --release
+        # No --release flag: this Tauri CLI builds release by default (opt out with --debug).
+        # run 41015997420 died here with "error: unexpected argument '--release' found".
+        run: pnpm tauri android build -t "${{ inputs.tauri_target }}" --apk
 
       - name: sign release apk with the fixed Reeed keystore
         env:
@@ -147,6 +149,23 @@ jobs:
             | grep -qiE "0xffffffff|true" \
             || { echo "ASSERT FAIL: largeHeap missing or not true"; exit 1; }
           echo "APK_ASSERTIONS=passed" >> "$GITHUB_ENV"
+
+      - name: css nesting evidence (diagnostic only)
+        working-directory: apps/readest-app
+        run: |
+          set +e
+          # Client doc §3: CSS nesting needs Chromium 120. Either the built CSS has
+          # no `&`, or we cannot tell whether the glob matched at all - keep the two
+          # outcomes distinguishable instead of swallowing both with `|| true`.
+          mapfile -t CSS < <(find out -name '*.css' -print 2>/dev/null)
+          if [ ${#CSS[@]} -eq 0 ]; then
+            echo "NO_CSS_MATCHED"
+          else
+            echo "css files: ${#CSS[@]}"
+            for f in "${CSS[@]}"; do
+              printf '%s %s\n' "$(grep -o '&' "$f" | wc -l)" "$f"
+            done
+          fi
 
       - name: report apks
         run: |
