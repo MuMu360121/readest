@@ -2,7 +2,9 @@
 """Rebrand the Readest source tree as Reeed for a self-built Android 7.1 APK.
 
 What it changes (outward-facing identity only):
-  - tauri.conf.json : productName / mainBinaryName / identifier / android minSdkVersion / updater endpoints
+  - tauri.conf.json : productName / identifier / android minSdkVersion / updater endpoints
+    (mainBinaryName is left alone: the generated Gradle project and the Rust lib
+     name are wired to the upstream value, and changing it buys nothing visible)
   - public/manifest.json : PWA name, short_name, description
   - public/locales/*/translation.json : display values mentioning the upstream brand
   - data/icons/reeed.png + public/icon.png : a generated icon (the upstream artwork is not redistributable as our own)
@@ -39,7 +41,6 @@ def patch_tauri_conf() -> None:
     path = APP / "src-tauri" / "tauri.conf.json"
     conf = json.loads(path.read_text(encoding="utf-8"))
     conf["productName"] = NEW_NAME
-    conf["mainBinaryName"] = NEW_BINARY
     conf["identifier"] = NEW_ID
     conf.setdefault("bundle", {}).setdefault("android", {})["minSdkVersion"] = MIN_SDK
 
