@@ -235,6 +235,10 @@ jobs:
             ${{ runner.temp }}/certs.txt
             ${{ runner.temp }}/sha256.txt
             apps/readest-app/src-tauri/gen/android/app/build/outputs/apk/**/release/*.apk
+            # The built stylesheets, a few hundred KB: the APK stores the frontend
+            # brotli-compressed inside libreadestlib.so, so QA cannot grep it there.
+            # With these files in hand the nesting question is answerable offline.
+            apps/readest-app/out/**/*.css
           if-no-files-found: warn
 
       - uses: actions/upload-artifact@v4
