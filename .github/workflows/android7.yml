@@ -128,9 +128,11 @@ jobs:
           BUILD_TOOLS=$(dirname "$AAPT2")
           echo "APK=$APK"
           ls -l "$APK"
-          sha256sum "$APK"
+          sha256sum "$APK" | tee "$RUNNER_TEMP/sha256.txt"
           echo "--- apksigner verify ---"
-          "$BUILD_TOOLS/apksigner" verify --print-certs "$APK"
+          # Persisted into the artifact, not only the log: P0-9 asks for one fingerprint
+          # across builds, and a log that expires cannot answer that question later.
+          "$BUILD_TOOLS/apksigner" verify --print-certs "$APK" | tee "$RUNNER_TEMP/certs.txt"
           echo "--- badging ---"
           "$AAPT2" dump badging "$APK" \
             | grep -E "^(package:|sdkVersion:|targetSdkVersion:|native-code:|application-label:)" || true
@@ -179,4 +181,6 @@ jobs:
             ${{ env.APK }}
             ${{ runner.temp }}/badging.txt
             ${{ runner.temp }}/manifest.xmltree.txt
+            ${{ runner.temp }}/certs.txt
+            ${{ runner.temp }}/sha256.txt
           if-no-files-found: error
