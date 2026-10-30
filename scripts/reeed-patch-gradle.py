@@ -80,6 +80,36 @@ def patch_manifest(text: str) -> tuple[str, bool]:
     return text[: match.start()] + new_tag + text[match.end():], True
 
 
+LEGACY_PACKAGING = "useLegacyPackaging = true"
+
+
+def patch_packaging(text: str) -> tuple[str, bool]:
+    """Make the installer extract the native libs instead of mmap-ing the APK.
+
+    The release package carries a 47.5 MiB STORED libreadestlib.so and
+    `android:extractNativeLibs="false"`, so the loader maps it out of the APK.
+    On a container-style Android (the Kindle build) that mmap can be refused and
+    the process dies at startup with UnsatisfiedLinkError. Setting
+    `packaging { jniLibs { useLegacyPackaging = true } }` goes back to extracting
+    the .so into /data/app/<pkg>/lib. It costs ~50 MiB of /data, which is why it
+    is an opt-in switch and not the default.
+    """
+    if LEGACY_PACKAGING in text:
+        return text, False
+    payload = (
+        "    // Reeed: extract jniLibs on install instead of mmap-ing the APK.\n"
+        "    // A 47.5 MiB STORED .so plus extractNativeLibs=false dies on\n"
+        "    // container-style Android with UnsatisfiedLinkError.\n"
+        "    packaging {\n"
+        "        jniLibs {\n"
+        f"            {LEGACY_PACKAGING}\n"
+        "        }\n"
+        "    }\n"
+    )
+    injected = _inject(text, "android {", payload)
+    return injected, injected != text
+
+
 def main() -> int:
     problems = []
     for path in (GRADLE, MANIFEST):
@@ -101,6 +131,23 @@ def main() -> int:
         MANIFEST.write_text(manifest, encoding="utf-8")
         print(f"injected {LARGE_HEAP}")
 
+    # Opt-in: extract jniLibs on install (see patch_packaging for the why).
+    # The switch must live on the step that runs THIS script, not on an earlier
+    # step: the env var is read here, and nowhere else.
+    legacy = os.environ.get("REEED_LEGACY_PACKAGING") == "1"
+    if legacy:
+        gradle = GRADLE.read_text(encoding="utf-8")
+        gradle, added_packaging = patch_packaging(gradle)
+        if added_packaging:
+            GRADLE.write_text(gradle, encoding="utf-8")
+            print(f"injected {LEGACY_PACKAGING}")
+        else:
+            print(f"{LEGACY_PACKAGING} not injected (android block anchor missing "
+                  f"or already present) — the assertion below decides")
+    else:
+        print(f"legacy packaging not requested (REEED_LEGACY_PACKAGING="
+              f"{os.environ.get('REEED_LEGACY_PACKAGING', '<unset>')})")
+
     # Report the flavours that will actually be used, so the CI log records them.
     for dim, default in DIMENSIONS:
         env_key = f"ORG_GRADLE_PROJECT_{dim}Flavor"
@@ -115,6 +162,14 @@ def main() -> int:
         (GRADLE, 'missingDimensionStrategy("pen"', "pen dimension not injected"),
         (MANIFEST, LARGE_HEAP, "largeHeap missing from the generated manifest"),
     )
+    checks = list(checks)
+    if legacy:
+        # Requested but not applied is worse than not requested: the job would
+        # publish an APK labelled "extracted-libs" that still loads in place.
+        checks.append(
+            (GRADLE, LEGACY_PACKAGING,
+             "REEED_LEGACY_PACKAGING=1 but useLegacyPackaging was not injected"),
+        )
     for path, needle, reason in checks:
         if needle not in path.read_text(encoding="utf-8"):
             problems.append(f"{reason}: {needle!r} not found in {path}")
@@ -125,7 +180,8 @@ def main() -> int:
             print(f"ASSERTION FAILED: {problem}", file=sys.stderr)
         return 1
 
-    print("verified: minSdk=25, applicationId=app.reeed.reader, largeHeap, both flavours")
+    print("verified: minSdk=25, applicationId=app.reeed.reader, largeHeap, both flavours"
+          + (", useLegacyPackaging" if legacy else ""))
     return 0
 
 
