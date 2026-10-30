@@ -109,6 +109,14 @@ def patch_queries(text):
 
     lines = "".join('        <package android:name="%s" />\n' % p for p in missing)
 
+    # 自闭合的 <queries /> 也得认：只按成对标签匹配会漏掉它，
+    # 然后插入第二个 <queries> —— aapt2 直接报重复元素，白烧一轮构建。
+    m0 = re.search(r"<queries\b[^>]*?/>", text, re.S)
+    if m0:
+        block = "<queries>\n%s    </queries>" % lines
+        print("manifest: expanded self-closing <queries> with %d package(s)" % len(missing))
+        return text[: m0.start()] + block + text[m0.end():]
+
     m = re.search(r"<queries\b[^>]*>\s*</queries>", text, re.S)
     if m:
         merged = "<queries>\n%s    </queries>" % lines
