@@ -199,8 +199,10 @@ jobs:
 
       # Evidence only: uploaded even when an assertion failed above, so a failing
       # run can be diagnosed from badging.txt / manifest.xmltree.txt / certs.txt.
-      # The APK is NOT in this artifact; it goes to the next step, which only runs
-      # when every assertion passed.
+      # The SIGNED apk is NOT here; it goes to the step below, which only runs when
+      # every assertion passed. The *unsigned* build output is included on purpose so
+      # QA can cross-check the manifest offline instead of waiting for another build;
+      # the filename keeps it from being mistaken for a deliverable.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -210,6 +212,7 @@ jobs:
             ${{ runner.temp }}/manifest.xmltree.txt
             ${{ runner.temp }}/certs.txt
             ${{ runner.temp }}/sha256.txt
+            apps/readest-app/src-tauri/gen/android/app/build/outputs/apk/**/release/*.apk
           if-no-files-found: warn
 
       - uses: actions/upload-artifact@v4
