@@ -57,15 +57,38 @@ object CrashReport {
         return found.joinToString(" | ")
     }
 
+    /** 外部 → 内部 filesDir → cache，逐个探测；null 表示该级不可用。 */
+    private fun candidateDirs(ctx: Context): List<File> {
+        val dirs = ArrayList<File>()
+        var external: File? = null
+        try {
+            external = ctx.getExternalFilesDir(null)
+        } catch (t: Throwable) {
+            external = null
+        }
+        if (external != null) dirs.add(external)
+
+        try {
+            val internal = ctx.filesDir
+            if (internal != null) dirs.add(internal)
+        } catch (t: Throwable) {
+            // 内部存储理论上一定存在，拿不到就跳过
+        }
+
+        try {
+            val cache = ctx.cacheDir
+            if (cache != null) dirs.add(cache)
+        } catch (t: Throwable) {
+            // 同上
+        }
+        return dirs
+    }
+
     /** 按 外部 → 内部 → cache 顺序尝试，返回真正写成的那条绝对路径；全失败才返回 null。 */
     fun write(ctx: Context, text: String): String? {
-        val dirs = ArrayList<File?>()
-        dirs.add(try { ctx.getExternalFilesDir(null) } catch (t: Throwable) { null })
-        dirs.add(try { ctx.filesDir } catch (t: Throwable) { null })
-        dirs.add(try { ctx.cacheDir } catch (t: Throwable) { null })
+        val dirs = candidateDirs(ctx)
 
         for (dir in dirs) {
-            if (dir == null) continue
             val path = try {
                 if (!dir.exists()) dir.mkdirs()
                 val f = File(dir, "crash.txt")
@@ -81,13 +104,9 @@ object CrashReport {
 
     /** 与 write() 同顺序读取，供 :crash 进程在拿不到 Intent extra 时回读。 */
     fun read(ctx: Context): String? {
-        val dirs = ArrayList<File?>()
-        dirs.add(try { ctx.getExternalFilesDir(null) } catch (t: Throwable) { null })
-        dirs.add(try { ctx.filesDir } catch (t: Throwable) { null })
-        dirs.add(try { ctx.cacheDir } catch (t: Throwable) { null })
+        val dirs = candidateDirs(ctx)
 
         for (dir in dirs) {
-            if (dir == null) continue
             try {
                 val f = File(dir, "crash.txt")
                 if (f.exists() && f.length() > 0L) return f.readText()
