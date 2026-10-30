@@ -1,8 +1,12 @@
 name: Android 7.1 (API 25) Reeed APK
 
-# Builds a self-branded (Reeed) armv7 debug APK whose minSdkVersion is 25,
+# Builds a self-branded (Reeed) armv7 *release* APK whose minSdkVersion is 25,
 # so it installs on Android 7.1 / API 25 containers (Kindle e-readers etc.).
-# Debug build: no signing config needed, sideloadable as-is.
+# Release (stripped) because the debug APK is ~573 MiB of Rust debug symbols.
+# Signed with the FIXED Reeed key (repo secrets REED_*), not a per-run throwaway key:
+# a new key on every build makes `adb install -r` fail with INSTALL_FAILED_UPDATE_INCOMPATIBLE,
+# which would force a wipe-and-reinstall and lose the user's library (PRD P0-9).
+# The verify step is the only evidence chain for minSdk / package / label / largeHeap.
 
 on:
   workflow_dispatch:
@@ -83,17 +87,77 @@ jobs:
         working-directory: apps/readest-app
         run: pnpm tauri icon ../../data/icons/reeed.png
 
-      - name: build debug apk
+      - name: build release apk (stripped, not yet signed)
         working-directory: apps/readest-app
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
-        run: pnpm tauri android build -t "${{ inputs.tauri_target }}" --debug
+          # Make the flavour choice an explicit contract instead of a script default
+          # (tauri android build does not forward -P to Gradle).
+          ORG_GRADLE_PROJECT_storeFlavor: foss
+          ORG_GRADLE_PROJECT_penFlavor: genericPen
+        run: pnpm tauri android build -t "${{ inputs.tauri_target }}" --release
+
+      - name: sign release apk with the fixed Reeed keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.REED_KEYSTORE_B64 }}
+          KS_ALIAS: ${{ secrets.REED_KEY_ALIAS }}
+          KS_PASS: ${{ secrets.REED_KEYSTORE_PASS }}
+          KEY_PASS: ${{ secrets.REED_KEY_PASS }}
+        run: |
+          set -euo pipefail
+          APK=$(find apps/readest-app/src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | sort | head -n1)
+          test -n "$APK"
+          test -n "${KEYSTORE_B64:-}" || { echo "ASSERT FAIL: REED_KEYSTORE_B64 secret missing"; exit 1; }
+          AAPT2=$(ls -1 "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -n1)
+          BUILD_TOOLS=$(dirname "$AAPT2")
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/reeed-ci.p12"
+          "$BUILD_TOOLS/zipalign" -f -p 4 "$APK" "$RUNNER_TEMP/aligned.apk"
+          "$BUILD_TOOLS/apksigner" sign --ks "$RUNNER_TEMP/reeed-ci.p12" --ks-type PKCS12 \
+            --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS" --ks-key-alias "$KS_ALIAS" \
+            --out "$RUNNER_TEMP/reeed-release.apk" "$RUNNER_TEMP/aligned.apk"
+          echo "--- signer certificate (must be identical on every run) ---"
+          "$BUILD_TOOLS/apksigner" verify --print-certs "$RUNNER_TEMP/reeed-release.apk" | grep -i 'SHA-256 digest'
+          echo "APK=$RUNNER_TEMP/reeed-release.apk" >> "$GITHUB_ENV"
+
+      - name: verify apk (signature + badging + manifest assertions)
+        run: |
+          set -euo pipefail
+          AAPT2=$(ls -1 "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -n1)
+          BUILD_TOOLS=$(dirname "$AAPT2")
+          echo "APK=$APK"
+          ls -l "$APK"
+          sha256sum "$APK"
+          echo "--- apksigner verify ---"
+          "$BUILD_TOOLS/apksigner" verify --print-certs "$APK"
+          echo "--- badging ---"
+          "$AAPT2" dump badging "$APK" \
+            | grep -E "^(package:|sdkVersion:|targetSdkVersion:|native-code:|application-label:)" || true
+          echo "--- manifest (largeHeap) ---"
+          "$AAPT2" dump xmltree --file AndroidManifest.xml "$APK" | grep -i largeHeap || true
+          "$AAPT2" dump badging "$APK" > "$RUNNER_TEMP/badging.txt"
+          "$AAPT2" dump xmltree --file AndroidManifest.xml "$APK" > "$RUNNER_TEMP/manifest.xmltree.txt"
+          # P0-1 / P0-7 / P0-8: the only evidence chain for these lives here.
+          grep -q "package: name='app.reeed.reader'" "$RUNNER_TEMP/badging.txt" \
+            || { echo "ASSERT FAIL: package name"; exit 1; }
+          grep -q "sdkVersion:'25'" "$RUNNER_TEMP/badging.txt" \
+            || { echo "ASSERT FAIL: minSdkVersion"; exit 1; }
+          grep -q "application-label:'Reeed'" "$RUNNER_TEMP/badging.txt" \
+            || { echo "ASSERT FAIL: application-label"; exit 1; }
+          grep -i largeHeap "$RUNNER_TEMP/manifest.xmltree.txt" \
+            | grep -qiE "0xffffffff|true" \
+            || { echo "ASSERT FAIL: largeHeap missing or not true"; exit 1; }
+          echo "APK_ASSERTIONS=passed" >> "$GITHUB_ENV"
 
       - name: report apks
-        run: find apps/readest-app/src-tauri/gen/android/app/build/outputs -name "*.apk" -printf "%p %s bytes\n" || true
+        run: |
+          find apps/readest-app/src-tauri/gen/android/app/build/outputs -name "*.apk" -printf "%p %s bytes\n" || true
+          printf "signed APK: %s bytes\n" "$(stat -c %s "$APK")"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: reeed-minsdk25-${{ inputs.tauri_target }}-debug
-          path: apps/readest-app/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          name: reeed-minsdk25-${{ inputs.tauri_target }}-release
+          path: |
+            ${{ env.APK }}
+            ${{ runner.temp }}/badging.txt
+            ${{ runner.temp }}/manifest.xmltree.txt
           if-no-files-found: error
