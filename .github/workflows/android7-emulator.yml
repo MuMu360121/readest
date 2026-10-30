@@ -23,6 +23,11 @@ jobs:
   emulator-api25:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # The repository default is `contents: read` only, which makes `gh run list`
+    # and `gh run download` fail with 403 before the emulator is ever installed.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: free disk space
         run: |
@@ -61,7 +66,8 @@ jobs:
           APK=$(find apk -name '*.apk' | head -n1)
           echo "APK=$APK" >> "$GITHUB_ENV"
           ls -l "$APK"
-          sha256sum "$APK"
+          sha256sum "$APK" | tee "$RUNNER_TEMP/apk-identity.txt"
+          ls -l "$APK" >> "$RUNNER_TEMP/apk-identity.txt"
 
       - name: install emulator and the API 25 armeabi-v7a image
         run: |
@@ -103,11 +109,18 @@ jobs:
           timeout 1500 bash -c '
             until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" = "1" ]; do
               sleep 10
-            done' && echo "BOOT_COMPLETED=yes" || {
-              echo "BOOT_COMPLETED=no"
-              adb devices
-              tail -40 "$RUNNER_TEMP/emulator.log"
-            }
+            done'
+          BOOT_EXIT=$?
+          if [ "$BOOT_EXIT" -ne 0 ]; then
+            echo "BOOT_COMPLETED=no"
+            adb devices
+            tail -40 "$RUNNER_TEMP/emulator.log"
+            # A timeout here is a real failure of this job, not a green run with
+            # a note: evidence upload still happens (if: always) but the job must
+            # not be reported as passing.
+            exit 1
+          fi
+          echo "BOOT_COMPLETED=yes"
 
       - name: record the device baseline (QA G2-0)
         run: |
@@ -127,21 +140,37 @@ jobs:
           set +e
           {
             echo "--- adb install -r (first) ---"
-            adb install -r "$APK" 2>&1
-            echo "FIRST_INSTALL_EXIT=$?"
+            adb install -r "$APK" 2>&1 | tee "$RUNNER_TEMP/install-first.txt"
+            FIRST_EXIT=${PIPESTATUS[0]}
+            echo "FIRST_INSTALL_EXIT=$FIRST_EXIT"
             echo "--- pm list packages ---"
             adb shell pm list packages | grep -i reeed || echo "PACKAGE_NOT_LISTED"
+            echo "--- mark a file inside the app's data dir (P0-9 data survival) ---"
+            # google_apis images are userdebug, so adb root works here; on a retail
+            # phone this half can only be judged by the app itself.
+            adb root > /dev/null 2>&1; sleep 3
+            adb shell mkdir -p /data/data/app.reeed.reader/files
+            adb shell "echo reeed-marker-$(date +%s) > /data/data/app.reeed.reader/files/p0-9-marker.txt"
+            adb shell cat /data/data/app.reeed.reader/files/p0-9-marker.txt
             echo "--- adb install -r (second, over the first) ---"
-            adb install -r "$APK" 2>&1
-            echo "SECOND_INSTALL_EXIT=$?"
+            adb install -r "$APK" 2>&1 | tee "$RUNNER_TEMP/install-second.txt"
+            SECOND_EXIT=${PIPESTATUS[0]}
+            echo "SECOND_INSTALL_EXIT=$SECOND_EXIT"
+            echo "--- marker after the second install ---"
+            adb shell cat /data/data/app.reeed.reader/files/p0-9-marker.txt 2>&1 || echo "MARKER_LOST"
             echo "--- package record (data dir / UID) ---"
-            # run-as needs a debuggable package and this one is not, so read the
-            # install record instead of the app's private files.
             adb shell dumpsys package app.reeed.reader 2>&1 | grep -iE "dataDir|userId|codePath" | head -5
             adb shell ls -ld /data/data/app.reeed.reader 2>&1 | head -3
             echo "--- df -h /data (after install) ---"
             adb shell df -h /data
           } 2>&1 | tee "$RUNNER_TEMP/install.txt"
+          # Same rule as the apk assertions: a failed install must fail the job,
+          # otherwise a green run is indistinguishable from "never installed".
+          grep -q "Success" "$RUNNER_TEMP/install-first.txt" \
+            || { echo "ASSERT FAIL: first adb install did not print Success"; exit 1; }
+          grep -q "Success" "$RUNNER_TEMP/install-second.txt" \
+            || { echo "ASSERT FAIL: second adb install did not print Success"; exit 1; }
+          echo "INSTALL_ASSERTIONS=passed"
 
       - name: launch it and capture what the system says
         run: |
@@ -151,6 +180,9 @@ jobs:
           sleep 45
           echo "PID=$(adb shell pidof app.reeed.reader | tr -d '\r')" | tee "$RUNNER_TEMP/launch.txt"
           adb logcat -d > "$RUNNER_TEMP/logcat.txt"
+          # The crash buffer is what names the exception; the main buffer
+          # often has it wrapped away by the time we read.
+          adb logcat -d -b crash > "$RUNNER_TEMP/logcat-crash.txt" 2>&1 || true
           {
             echo "--- WebViewUpgrade ---"
             grep -iE "WebViewUpgrade" "$RUNNER_TEMP/logcat.txt" | tail -20
@@ -172,6 +204,8 @@ jobs:
             ${{ runner.temp }}/install.txt
             ${{ runner.temp }}/launch.txt
             ${{ runner.temp }}/logcat.txt
+            ${{ runner.temp }}/logcat-crash.txt
+            ${{ runner.temp }}/apk-identity.txt
             ${{ runner.temp }}/emulator.log
             ${{ runner.temp }}/screen.png
           if-no-files-found: warn
