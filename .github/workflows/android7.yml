@@ -15,6 +15,19 @@ on:
         description: 'Tauri/Android target (armv7 / arm64 / i686 / x86_64)'
         required: false
         default: 'armv7'
+      # Bisect switch for the launch crash (P0-2) on the Kindle container:
+      # with extractNativeLibs=false the loader mmaps the 47.5 MiB STORED
+      # libreadestlib.so straight out of the APK. A container-style installer can
+      # refuse that (UnsatisfiedLinkError at startup). 'true' extracts the .so into
+      # /data/app/<pkg>/lib instead, at the cost of ~50 MiB of /data.
+      legacy_packaging:
+        description: 'Bisect: extract jniLibs on install instead of mmap-ing the APK'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 permissions:
   contents: read
@@ -81,7 +94,13 @@ jobs:
             src-tauri/gen/android/app/build.gradle.kts
 
       - name: patch generated gradle for plugin flavor dimensions
-        run: python3 scripts/reeed-patch-gradle.py
+        env:
+          REEED_LEGACY_PACKAGING: ${{ inputs.legacy_packaging == 'true' && '1' || '0' }}
+        run: |
+          python3 scripts/reeed-patch-gradle.py
+          echo "LEGACY_PACKAGING=${{ inputs.legacy_packaging }}"
+          grep -n -A4 'packaging {' apps/readest-app/src-tauri/gen/android/app/build.gradle.kts \
+            || echo "NO_PACKAGING_BLOCK_IN_GRADLE"
 
       - name: apply icon
         working-directory: apps/readest-app
@@ -176,6 +195,21 @@ jobs:
           grep -i largeHeap "$RUNNER_TEMP/manifest.xmltree.txt" \
             | grep -qiE "0xffffffff|true" \
             || { echo "ASSERT FAIL: largeHeap missing or not true"; exit 1; }
+          # Bisect contract: the requested packaging mode must be the one in the
+          # merged manifest. AGP derives android:extractNativeLibs from
+          # jniLibs.useLegacyPackaging, so a silently unapplied switch would produce
+          # a package that looks like the bisect arm and is not.
+          grep -i extractNativeLibs "$RUNNER_TEMP/manifest.xmltree.txt" \
+            | tee "$RUNNER_TEMP/extractNativeLibs.txt" || echo "NO_EXTRACTNATIVELIBS_ATTR"
+          if [ "${{ inputs.legacy_packaging }}" = "true" ]; then
+            grep -qiE "extractNativeLibs.*(=|\(0x[0-9a-f]+\))=true" "$RUNNER_TEMP/manifest.xmltree.txt" \
+              || { echo "ASSERT FAIL: legacy_packaging=true but extractNativeLibs is not true"; exit 1; }
+            echo "EXTRACT_NATIVE_LIBS_ASSERT=legacy(true)"
+          else
+            grep -qiE "extractNativeLibs.*=false" "$RUNNER_TEMP/manifest.xmltree.txt" \
+              || { echo "ASSERT FAIL: legacy_packaging=false but extractNativeLibs is not false"; exit 1; }
+            echo "EXTRACT_NATIVE_LIBS_ASSERT=modern(false)"
+          fi
           # P0-1 prerequisite: Android 7.1 verifies v1 and v2 only. A v3-only package
           # installs on nothing older than API 28 while every other assertion is green.
           grep -qE "Verified using v[12] scheme.*: true" "$RUNNER_TEMP/certs.txt" \
@@ -231,10 +265,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: reeed-apk-evidence-${{ inputs.tauri_target }}
+          name: reeed-apk-evidence-${{ inputs.tauri_target }}${{ inputs.legacy_packaging == 'true' && '-legacy' || '' }}
           path: |
             ${{ runner.temp }}/badging.txt
             ${{ runner.temp }}/manifest.xmltree.txt
+            ${{ runner.temp }}/extractNativeLibs.txt
             ${{ runner.temp }}/certs.txt
             ${{ runner.temp }}/sha256.txt
             apps/readest-app/src-tauri/gen/android/app/build/outputs/apk/**/release/*.apk
@@ -246,11 +281,12 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: reeed-minsdk25-${{ inputs.tauri_target }}-release
+          name: reeed-minsdk25-${{ inputs.tauri_target }}-release${{ inputs.legacy_packaging == 'true' && '-extracted-libs' || '' }}
           path: |
             ${{ env.APK }}
             ${{ runner.temp }}/badging.txt
             ${{ runner.temp }}/manifest.xmltree.txt
+            ${{ runner.temp }}/extractNativeLibs.txt
             ${{ runner.temp }}/certs.txt
             ${{ runner.temp }}/sha256.txt
           if-no-files-found: error
