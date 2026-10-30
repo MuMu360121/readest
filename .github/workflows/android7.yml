@@ -76,6 +76,9 @@ jobs:
           grep -nE "applicationId|namespace|minSdk|targetSdk|compileSdk" \
             src-tauri/gen/android/app/build.gradle.kts
 
+      - name: patch generated gradle for plugin flavor dimensions
+        run: python3 scripts/reeed-patch-gradle.py
+
       - name: apply icon
         working-directory: apps/readest-app
         run: pnpm tauri icon ../../data/icons/reeed.png
