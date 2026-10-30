@@ -1,0 +1,163 @@
+# Reeed: API 25 device smoke test on an emulator.
+#
+# Why this exists: P0-1 / P0-2 / P0-9 need a real install (adb install -> Success,
+# a launch, df -h /data, a second install over the first). Nobody on the team has
+# a physical Android 7.1 phone, so those items sit at "not judged" forever. An
+# armeabi-v7a API 25 emulator is not a phone and is NOT a substitute for the
+# acceptance run, but it can prove or disprove the things that do not depend on
+# the exact handset: does the package install, does the process stay alive, what
+# WebView does the system provide, how much space does it need.
+#
+# It deliberately downloads the APK from the newest successful android7 build:
+# the artifact is the only package that passed the four manifest assertions.
+#
+# Copy this file to .github/workflows/android7-emulator.yml in the fork.
+# (The token used to prepare it has no `workflow` scope, so it cannot push here.)
+
+name: android7 emulator smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  emulator-api25:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: free disk space
+        run: |
+          set +e
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/ndk \
+                      /usr/local/lib/android/sdk/emulator \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: fetch the newest assertion-passed release apk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" \
+                     --workflow=android7.yml --status=success --limit=1 \
+                     --json databaseId -q '.[0].databaseId')
+          echo "SOURCE_RUN_ID=$RUN_ID"
+          echo "SOURCE_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          mkdir -p apk
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            -n reeed-minsdk25-armv7-release -D apk
+          APK=$(find apk -name '*.apk' | head -n1)
+          echo "APK=$APK" >> "$GITHUB_ENV"
+          ls -l "$APK"
+          sha256sum "$APK"
+
+      - name: install emulator and the API 25 armeabi-v7a image
+        run: |
+          set -euo pipefail
+          # The APK is armeabi-v7a only, so an x86 image would fail with
+          # INSTALL_FAILED_NO_MATCHING_ABIS and tell us nothing.
+          yes | sdkmanager --licenses > /dev/null || true
+          # If this image does not exist in the current SDK repo, fail with the list
+          # of what API 25 images ARE published instead of a bare "package not found".
+          sdkmanager "platform-tools" "emulator" \
+            || { sdkmanager --list | grep -i "system-images;android-25" || true; exit 1; }
+          sdkmanager "system-images;android-25;default;armeabi-v7a" \
+            || { echo "IMAGE_UNAVAILABLE"; sdkmanager --list | grep -i "system-images;android-2[456]" || true; exit 1; }
+          echo "yes" | sdkmanager --list_installed | head -20 || true
+
+      - name: create the avd
+        run: |
+          set -euo pipefail
+          echo "no" | avdmanager create avd -n api25 \
+            -k "system-images;android-25;default;armeabi-v7a" -d pixel --force
+          cat "$HOME/.android/avd/api25.avd/config.ini" | head -20
+
+      - name: boot the emulator (software ARM, slow by nature)
+        run: |
+          set +e
+          "$ANDROID_HOME/emulator/emulator" -avd api25 -no-window -no-audio \
+            -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 2048 \
+            > "$RUNNER_TEMP/emulator.log" 2>&1 &
+          adb start-server
+          adb devices
+          timeout 1500 bash -c '
+            until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" = "1" ]; do
+              sleep 10
+            done' && echo "BOOT_COMPLETED=yes" || {
+              echo "BOOT_COMPLETED=no"
+              adb devices
+              tail -40 "$RUNNER_TEMP/emulator.log"
+            }
+
+      - name: record the device baseline (QA G2-0)
+        run: |
+          set +e
+          {
+            echo "release: $(adb shell getprop ro.build.version.release | tr -d '\r')"
+            echo "sdk: $(adb shell getprop ro.build.version.sdk | tr -d '\r')"
+            echo "abi: $(adb shell getprop ro.product.cpu.abi | tr -d '\r')"
+            echo "--- dumpsys webviewupdate (current provider) ---"
+            adb shell dumpsys webviewupdate | grep -i current
+            echo "--- df -h /data (before install) ---"
+            adb shell df -h /data
+          } 2>&1 | tee "$RUNNER_TEMP/device-baseline.txt"
+
+      - name: install (P0-1) and install again over it (P0-9)
+        run: |
+          set +e
+          {
+            echo "--- adb install -r (first) ---"
+            adb install -r "$APK" 2>&1
+            echo "FIRST_INSTALL_EXIT=$?"
+            echo "--- pm list packages ---"
+            adb shell pm list packages | grep -i reeed || echo "PACKAGE_NOT_LISTED"
+            echo "--- adb install -r (second, over the first) ---"
+            adb install -r "$APK" 2>&1
+            echo "SECOND_INSTALL_EXIT=$?"
+            echo "--- package record (data dir / UID) ---"
+            # run-as needs a debuggable package and this one is not, so read the
+            # install record instead of the app's private files.
+            adb shell dumpsys package app.reeed.reader 2>&1 | grep -iE "dataDir|userId|codePath" | head -5
+            adb shell ls -ld /data/data/app.reeed.reader 2>&1 | head -3
+            echo "--- df -h /data (after install) ---"
+            adb shell df -h /data
+          } 2>&1 | tee "$RUNNER_TEMP/install.txt"
+
+      - name: launch it and capture what the system says
+        run: |
+          set +e
+          adb logcat -c
+          adb shell monkey -p app.reeed.reader -c android.intent.category.LAUNCHER 1 2>&1 | tail -5
+          sleep 45
+          echo "PID=$(adb shell pidof app.reeed.reader | tr -d '\r')" | tee "$RUNNER_TEMP/launch.txt"
+          adb logcat -d > "$RUNNER_TEMP/logcat.txt"
+          {
+            echo "--- WebViewUpgrade ---"
+            grep -iE "WebViewUpgrade" "$RUNNER_TEMP/logcat.txt" | tail -20
+            echo "--- chromiun/chromium errors ---"
+            grep -iE "chromium|cr_|UnsatisfiedLinkError|FATAL EXCEPTION" "$RUNNER_TEMP/logcat.txt" | tail -40
+            echo "--- Signal/ANR ---"
+            grep -iE "ANR in|signal [0-9]+|tombstone" "$RUNNER_TEMP/logcat.txt" | tail -10
+          } 2>&1 | tee -a "$RUNNER_TEMP/launch.txt"
+          adb exec-out screencap -p > "$RUNNER_TEMP/screen.png" 2>/dev/null
+          ls -l "$RUNNER_TEMP/screen.png"
+
+      - name: collect evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reeed-emulator-api25-evidence
+          path: |
+            ${{ runner.temp }}/device-baseline.txt
+            ${{ runner.temp }}/install.txt
+            ${{ runner.temp }}/launch.txt
+            ${{ runner.temp }}/logcat.txt
+            ${{ runner.temp }}/emulator.log
+            ${{ runner.temp }}/screen.png
+          if-no-files-found: warn
