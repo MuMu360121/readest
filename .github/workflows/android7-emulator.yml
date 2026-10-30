@@ -79,10 +79,18 @@ jobs:
 
       - name: create the avd
         run: |
-          set -euo pipefail
+          set +e
+          # The diagnostic cat must not kill the job: run 41027825593 died there with
+          # "cat: .../api25.avd/config.ini: No such file or directory" although
+          # avdmanager said "Auto-selecting single ABI armeabi-v7a". Print what really
+          # exists, then let the boot step decide.
           echo "no" | avdmanager create avd -n api25 \
             -k "system-images;android-25;google_apis;armeabi-v7a" -d pixel --force
-          cat "$HOME/.android/avd/api25.avd/config.ini" | head -20
+          echo "CREATE_AVD_EXIT=$?"
+          echo "--- avdmanager list avd ---"; avdmanager list avd
+          echo "--- emulator -list-avds ---"; "$ANDROID_HOME/emulator/emulator" -list-avds
+          echo "--- avd files under \$HOME/.android ---"; find "$HOME/.android" -maxdepth 3 -name '*.ini' 2>/dev/null | head
+          cat "$HOME/.android/avd/api25.avd/config.ini" 2>/dev/null | head -20 || echo "NO_CONFIG_INI"
 
       - name: boot the emulator (software ARM, slow by nature)
         run: |
