@@ -197,20 +197,23 @@ jobs:
             for f in "${CSS[@]}"; do
               printf '%s %s\n' "$(grep -o '&' "$f" | wc -l)" "$f"
             done
-            # A bare `&` count says nothing about what Chromium 119 drops: `&:hover`,
-            # `& .x`, `&::-webkit-*` are fine from Chromium 112; only a *declaration
-            # written after a nested rule inside the same block* needs 120. Dump the
-            # shapes so the classification is read, not guessed.
+            # A raw `&` count is not evidence: Tailwind emits `\&` inside arbitrary
+            # variant class names (`.\[\&\>\*\]\:p-2`), which is an escaped character
+            # in a selector, not CSS nesting. Only an unescaped `&` can mean nesting,
+            # and only the 120-gated shape (declaration after a nested rule) would
+            # break on Chromium 119. Count the two separately and dump the shapes.
             echo "--- & contexts (top 25 by frequency) ---"
             for f in "${CSS[@]}"; do
               [ "$(grep -c '&' "$f")" -eq 0 ] && continue
               echo "== $f"
               grep -o '.\{0,28\}&.\{0,28\}' "$f" | sort | uniq -c | sort -rn | head -25
-              # Chrome-120-only shape: `}` closing a nested rule followed by further
-              # declarations of the parent block (`}color:red`). At top level minified
-              # CSS only ever has `}selector{`, never `}prop:`, so a non-zero count here
-              # is the 120 gate; zero means 112-compatible nesting.
-              printf 'POST_RULE_DECL=%s\n' "$(grep -oE '\}[a-zA-Z-]+:[^;}]*[;}]' "$f" | wc -l)"
+              printf 'BARE_AMP=%s ESC_AMP=%s\n' \
+                "$(grep -oP '(?<!\\)&' "$f" | wc -l)" \
+                "$(grep -oP '\\&' "$f" | wc -l)"
+              # The one rule the 119 question actually turns on, read directly:
+              # flattened (`no-spinner::-webkit-*`) or still nested under `&`.
+              echo "--- no-spinner shapes ---"
+              grep -o '[^{},]*no-spinner[^{},]*' "$f" | sort -u | head -10
             done
           fi
 
