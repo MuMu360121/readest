@@ -28,6 +28,19 @@ on:
         options:
           - 'false'
           - 'true'
+      # Diagnostic builds only: inject app.reeed.reader.ReeedApplication (an
+      # UncaughtExceptionHandler installed in attachBaseContext) plus a :crash
+      # process CrashActivity that renders the stack on screen. This turns a
+      # "crashes on launch" report into the actual exception even when there is
+      # no adb on the target device. Never for a deliverable.
+      crash_handler:
+        description: 'Diagnostic: inject the on-device crash report screen'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 permissions:
   contents: read
@@ -101,6 +114,19 @@ jobs:
           echo "LEGACY_PACKAGING=${{ inputs.legacy_packaging }}"
           grep -n -A4 'packaging {' apps/readest-app/src-tauri/gen/android/app/build.gradle.kts \
             || echo "NO_PACKAGING_BLOCK_IN_GRADLE"
+
+      - name: inject on-device crash diagnostics (diagnostic builds only)
+        if: inputs.crash_handler == 'true'
+        run: |
+          set -euo pipefail
+          python3 scripts/reeed-crashhandler/inject.py apps/readest-app/src-tauri/gen/android
+          MAN=apps/readest-app/src-tauri/gen/android/app/src/main/AndroidManifest.xml
+          # Prove the injection landed in the manifest that will be merged, instead
+          # of trusting the script's own exit code.
+          grep -n 'ReeedApplication' "$MAN"
+          grep -n 'CrashActivity' "$MAN"
+          grep -n 'android:process=":crash"' "$MAN"
+          echo "CRASH_HANDLER=injected"
 
       - name: apply icon
         working-directory: apps/readest-app
@@ -195,6 +221,23 @@ jobs:
           grep -i largeHeap "$RUNNER_TEMP/manifest.xmltree.txt" \
             | grep -qiE "0xffffffff|true" \
             || { echo "ASSERT FAIL: largeHeap missing or not true"; exit 1; }
+          # Diagnostic contract: when the crash handler was requested, the merged
+          # manifest must name ReeedApplication and carry the :crash activity.
+          # A package that silently lacks them would look like a diagnostic build
+          # and answer nothing.
+          if [ "${{ inputs.crash_handler }}" = "true" ]; then
+            grep -q "app.reeed.reader.ReeedApplication" "$RUNNER_TEMP/manifest.xmltree.txt" \
+              || { echo "ASSERT FAIL: crash_handler=true but ReeedApplication is not the application class"; exit 1; }
+            grep -q "app.reeed.reader.CrashActivity" "$RUNNER_TEMP/manifest.xmltree.txt" \
+              || { echo "ASSERT FAIL: crash_handler=true but CrashActivity is missing"; exit 1; }
+            echo "CRASH_HANDLER_ASSERT=present"
+          else
+            if grep -q "app.reeed.reader.ReeedApplication" "$RUNNER_TEMP/manifest.xmltree.txt"; then
+              echo "ASSERT FAIL: crash_handler=false but ReeedApplication leaked into a deliverable"
+              exit 1
+            fi
+            echo "CRASH_HANDLER_ASSERT=absent"
+          fi
           # Bisect contract: the requested packaging mode must be the one in the
           # merged manifest. AGP derives android:extractNativeLibs from
           # jniLibs.useLegacyPackaging, so a silently unapplied switch would produce
@@ -265,7 +308,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: reeed-apk-evidence-${{ inputs.tauri_target }}${{ inputs.legacy_packaging == 'true' && '-legacy' || '' }}
+          name: reeed-apk-evidence-${{ inputs.tauri_target }}${{ inputs.legacy_packaging == 'true' && '-legacy' || '' }}${{ inputs.crash_handler == 'true' && '-diag' || '' }}
           path: |
             ${{ runner.temp }}/badging.txt
             ${{ runner.temp }}/manifest.xmltree.txt
@@ -281,7 +324,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: reeed-minsdk25-${{ inputs.tauri_target }}-release${{ inputs.legacy_packaging == 'true' && '-extracted-libs' || '' }}
+          name: reeed-minsdk25-${{ inputs.tauri_target }}-release${{ inputs.legacy_packaging == 'true' && '-extracted-libs' || '' }}${{ inputs.crash_handler == 'true' && '-diag' || '' }}
           path: |
             ${{ env.APK }}
             ${{ runner.temp }}/badging.txt
