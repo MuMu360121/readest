@@ -140,11 +140,34 @@ jobs:
           "$AAPT2" dump xmltree --file AndroidManifest.xml "$APK" | grep -i largeHeap || true
           "$AAPT2" dump badging "$APK" > "$RUNNER_TEMP/badging.txt"
           "$AAPT2" dump xmltree --file AndroidManifest.xml "$APK" > "$RUNNER_TEMP/manifest.xmltree.txt"
+          echo "--- manifest (uses-sdk) ---"
+          "$AAPT2" dump xmltree --file AndroidManifest.xml "$APK" \
+            | grep -A4 -i "E: uses-sdk" || echo "NO_USES_SDK_ELEMENT"
+          echo "--- full badging (first 40 lines) ---"
+          head -40 "$RUNNER_TEMP/badging.txt" || true
+          echo "--- merged manifest on disk (where uses-sdk should come from) ---"
+          while read -r f; do
+            echo "== $f"
+            grep -n -i "uses-sdk\|minSdk\|targetSdk" "$f" || echo "  (no uses-sdk/minSdk/targetSdk line in this file)"
+          done < <(find apps/readest-app/src-tauri/gen/android/app/build/intermediates -name AndroidManifest.xml 2>/dev/null | head -5)
+          echo "--- generated gradle after the build (did tauri regenerate it?) ---"
+          grep -n -i "minSdk" apps/readest-app/src-tauri/gen/android/app/build.gradle.kts || echo "NO_MINSDK_TOKEN_IN_GRADLE"
+          sed -n '/defaultConfig *{/,/^ *}/p' apps/readest-app/src-tauri/gen/android/app/build.gradle.kts | head -20 || true
           # P0-1 / P0-7 / P0-8: the only evidence chain for these lives here.
           grep -q "package: name='app.reeed.reader'" "$RUNNER_TEMP/badging.txt" \
             || { echo "ASSERT FAIL: package name"; exit 1; }
-          grep -q "sdkVersion:'25'" "$RUNNER_TEMP/badging.txt" \
-            || { echo "ASSERT FAIL: minSdkVersion"; exit 1; }
+          # aapt prints the minimum SDK as `sdkVersion:'NN'`; some build-tools versions
+          # spell it `minSdkVersion:'NN'`. Both state the same fact (the value is what is
+          # asserted), so accept either and say which one matched - same rule we used for
+          # largeHeap's `true` vs `0xffffffff`.
+          MIN_SDK_LINE=$(grep -E "^(sdkVersion|minSdkVersion):'25'" "$RUNNER_TEMP/badging.txt" || true)
+          if [ -n "$MIN_SDK_LINE" ]; then
+            echo "$MIN_SDK_LINE"
+            echo "MIN_SDK_ASSERT=passed"
+          else
+            echo "ASSERT FAIL: neither sdkVersion:'25' nor minSdkVersion:'25' in badging"
+            exit 1
+          fi
           grep -q "application-label:'Reeed'" "$RUNNER_TEMP/badging.txt" \
             || { echo "ASSERT FAIL: application-label"; exit 1; }
           grep -i largeHeap "$RUNNER_TEMP/manifest.xmltree.txt" \
@@ -173,6 +196,21 @@ jobs:
         run: |
           find apps/readest-app/src-tauri/gen/android/app/build/outputs -name "*.apk" -printf "%p %s bytes\n" || true
           printf "signed APK: %s bytes\n" "$(stat -c %s "$APK")"
+
+      # Evidence only: uploaded even when an assertion failed above, so a failing
+      # run can be diagnosed from badging.txt / manifest.xmltree.txt / certs.txt.
+      # The APK is NOT in this artifact; it goes to the next step, which only runs
+      # when every assertion passed.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reeed-apk-evidence-${{ inputs.tauri_target }}
+          path: |
+            ${{ runner.temp }}/badging.txt
+            ${{ runner.temp }}/manifest.xmltree.txt
+            ${{ runner.temp }}/certs.txt
+            ${{ runner.temp }}/sha256.txt
+          if-no-files-found: warn
 
       - uses: actions/upload-artifact@v4
         with:
