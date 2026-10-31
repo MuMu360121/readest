@@ -18,11 +18,22 @@ name: android7 emulator smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'android7 build run id that produced the deliverable'
+        required: false
+        default: '41071093920'
+      expected_sha256:
+        description: 'sha256 the installed apk must have (empty = do not check)'
+        required: false
+        default: '6e5a520d5af1cae6aa175a96bc477560fa9269c1f9d4ee93a26c5cc94906dc78'
 
 jobs:
   emulator-api25:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # An armeabi-v7a image on an x86 host runs under TCG, not KVM: boot alone can
+    # eat the whole 90 minutes, so the job has to outlive it.
+    timeout-minutes: 180
     # The repository default is `contents: read` only, which makes `gh run list`
     # and `gh run download` fail with 403 before the emulator is ever installed.
     permissions:
@@ -50,24 +61,63 @@ jobs:
         with:
           packages: 'platform-tools'
 
-      - name: fetch the newest assertion-passed release apk
+      - name: fetch the deliverable apk (pinned run, resolved name, sha asserted)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" \
-                     --workflow=android7.yml --status=success --limit=1 \
-                     --json databaseId -q '.[0].databaseId')
-          echo "SOURCE_RUN_ID=$RUN_ID"
-          echo "SOURCE_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          RUN_ID='${{ inputs.source_run_id }}'
+          EXPECTED_SHA256='${{ inputs.expected_sha256 }}'
+          [ -n "$RUN_ID" ] || { echo "ASSERT FAIL: source_run_id is empty"; exit 1; }
+          echo "SOURCE_RUN_ID=$RUN_ID" | tee -a "$GITHUB_ENV"
+
+          # The artifact name carries the build flavour as a suffix:
+          #   reeed-minsdk25-armv7-release-extracted-libs        <- deliverable
+          #   reeed-minsdk25-armv7-release-extracted-libs-diag   <- diagnostic build
+          # The old literal `-n reeed-minsdk25-armv7-release` therefore matched
+          # nothing (run 41054495626, step 5) once the suffix was introduced.
+          # Resolve the name from the API and refuse anything ambiguous: guessing
+          # here means possibly installing the wrong package and reporting it as
+          # evidence about the right one.
+          mapfile -t CANDIDATES < <(
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts" \
+              --jq '.artifacts[].name' \
+            | grep -E '^reeed-minsdk25-armv7-release' | grep -v -- '-diag$' | sort
+          )
+          printf 'ARTIFACT_CANDIDATES=%s\n' "${CANDIDATES[*]:-<none>}"
+          if [ "${#CANDIDATES[@]}" -ne 1 ]; then
+            echo "ASSERT FAIL: expected exactly 1 non-diag release artifact in run $RUN_ID, got ${#CANDIDATES[@]}"
+            exit 1
+          fi
+          NAME="${CANDIDATES[0]}"
+          echo "ARTIFACT_NAME=$NAME" | tee -a "$GITHUB_ENV"
+
           mkdir -p apk
-          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            -n reeed-minsdk25-armv7-release -D apk
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" -n "$NAME" -D apk
           APK=$(find apk -name '*.apk' | head -n1)
+          [ -n "$APK" ] || { echo "ASSERT FAIL: no .apk inside artifact $NAME"; exit 1; }
           echo "APK=$APK" >> "$GITHUB_ENV"
           ls -l "$APK"
-          sha256sum "$APK" | tee "$RUNNER_TEMP/apk-identity.txt"
-          ls -l "$APK" >> "$RUNNER_TEMP/apk-identity.txt"
+
+          ACTUAL_SHA256=$(sha256sum "$APK" | cut -d' ' -f1)
+          echo "APK_SHA256=$ACTUAL_SHA256" | tee -a "$GITHUB_ENV"
+          {
+            echo "SOURCE_RUN_ID=$RUN_ID"
+            echo "ARTIFACT_NAME=$NAME"
+            echo "APK=$APK"
+            echo "APK_BYTES=$(stat -c %s "$APK")"
+            echo "APK_SHA256=$ACTUAL_SHA256"
+            echo "EXPECTED_SHA256=$EXPECTED_SHA256"
+          } > "$RUNNER_TEMP/apk-identity.txt"
+          cat "$RUNNER_TEMP/apk-identity.txt"
+
+          # Installing a package that is not the published deliverable would make
+          # the whole run evidence about the wrong bytes.
+          if [ -n "$EXPECTED_SHA256" ] && [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo "ASSERT FAIL: apk sha256 $ACTUAL_SHA256 != expected $EXPECTED_SHA256"
+            exit 1
+          fi
+          echo "APK_SHA256_ASSERT=passed"
 
       - name: install emulator and the API 25 armeabi-v7a image
         run: |
@@ -106,7 +156,7 @@ jobs:
             > "$RUNNER_TEMP/emulator.log" 2>&1 &
           adb start-server
           adb devices
-          timeout 1500 bash -c '
+          timeout 2700 bash -c '
             until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" = "1" ]; do
               sleep 10
             done'
